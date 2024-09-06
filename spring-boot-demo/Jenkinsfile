@@ -1,0 +1,101 @@
+pipeline {
+    agent any
+    environment {
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        AWS_DEFAULT_REGION = "us-west-2"
+    }
+    tools{
+        jdk 'jdk17'
+        maven 'maven3'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', changelog: false, poll: false, url: 'https://github.com/amitambig/End-to-end-CICD-Project.git'
+            }
+        }
+        stage('Compile'){
+            steps{
+                sh 'cd spring-boot-demo && mvn clean compile -DskipTests=true'
+            }
+        }
+        stage('OWASP Scan') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ ', odcInstallation: 'dp'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                
+            }
+        }
+        stage('Code Analysis'){
+            steps{
+                withSonarQubeEnv('sonar-server') {
+                    sh '''cd spring-boot-demo && mvn clean verify sonar:sonar -DskipTests=true\
+                    -Dsonar.projectKey=Project-CICD '''
+                }
+            }
+        }
+        stage('Docker Build & push') {
+            steps {
+                script{
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                        sh "cd spring-boot-demo && docker build -t shopping-cart -f Dockerfile ."
+                        sh "docker tag shopping-cart amitambig/myspringbootapp:${BUILD_NUMBER}"
+                        sh "docker push amitambig/myspringbootapp:${BUILD_NUMBER}"
+                    }
+                }
+            }
+        }
+        
+        stage('Update Deployment File') {
+            environment {
+                GIT_REPO_NAME = "End-to-end-CICD-Project"
+                GIT_USER_NAME = "amitambig"
+        }
+        steps {
+            withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                sh '''
+                    git config user.email "amitambig@gmail.com"
+                    git config user.name "amitambig"
+                    BUILD_NUMBER=${BUILD_NUMBER}
+                    sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" EKS/Configuration/deployment.yml
+                    git add EKS/Configuration/deployment.yml
+                    git commit -m "Update deployment image to version ${BUILD_NUMBER}"
+                    git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                '''
+                 }
+            }
+        }
+        stage('Initializing Terraform'){
+            steps{
+                script{
+                    dir('EKS'){
+                        sh 'terraform init'
+                    }
+                }
+            }
+        }
+        
+        stage('Creating/Destroying an EKS Cluster'){
+            steps{
+                script{
+                    dir('EKS') {
+                        sh 'terraform $action --auto-approve'
+                    }
+                }
+            }
+        }
+        stage('Deploying Application') {
+            steps{
+                script{
+                    dir('EKS/Configuration') {
+                        sh 'aws eks update-kubeconfig --name my-eks-cluster'
+                        sh 'kubectl apply -f deployment.yml'
+                        sh 'kubectl apply -f service.yml'
+                    }
+                }
+            }
+        }
+    }
+}
